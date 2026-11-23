@@ -70,6 +70,20 @@ api: add rate limiting to public endpoints
 [NOJIRA] Migrate billing cron to new scheduler
 ```
 
+## Naming on demand
+
+```
+/session-namer:name-session
+```
+
+Names the current session right away from the whole conversation, and tells
+you the result. It ignores the turn cadence and the rename limit, and it
+replaces a name you set by hand. The plugin treats the new name as its own,
+so later turns may still upgrade it.
+
+In the very first message of a new session there is no transcript yet, so
+there is nothing to name; run it once the conversation has started.
+
 ## How it works
 
 The plugin registers two async hooks, so the model call never blocks your turn:
@@ -79,7 +93,8 @@ The plugin registers two async hooks, so the model call never blocks your turn:
 
 A session's title is the last `{"type":"custom-title"}` line in its transcript.
 Appending one renames the session, which is the same mechanism `/rename` uses.
-A name you set with `/rename` is never overwritten.
+A name you set with `/rename` is never overwritten, unless you ask for it
+with `/name-session`.
 
 The only network call is the model request. It runs `claude -p` on Haiku in a
 bare configuration: a short system prompt of its own, no tools, no MCP

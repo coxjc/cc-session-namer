@@ -1,6 +1,6 @@
 {
   "name": "session-namer",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Automatically name every Claude Code session from the full conversation, with a single Haiku call. Replaces reaching for /rename.",
   "author": {
     "name": "sorrycc",
