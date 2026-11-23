@@ -30,23 +30,36 @@
 
 set -uo pipefail
 
-# Nothing here is meant for stdout: both hosts hand an async hook's stdout to
-# the model as extra context. Command substitutions are unaffected.
-exec >/dev/null
+# `--force [session-id]` is the /name-session command: name this session now,
+# whatever the cadence, the rename budget, or a name set by hand say. It reads
+# no hook payload and reports its outcome on stdout.
+FORCE=0 forced_id=""
+if [ "${1:-}" = "--force" ]; then
+  FORCE=1
+  forced_id="${2:-}"
+fi
 
-[ -n "${SESSION_NAMER_DISABLE:-}" ] && exit 0
+# Nothing in a hook run is meant for stdout: Claude Code hands an async hook's
+# stdout to the model as extra context. The original stdout is kept on fd 3
+# for --force. Command substitutions are unaffected.
+exec 3>&1 >/dev/null
+
+# Explain an outcome to whoever ran /name-session. Silent in a hook run.
+say() { [ "$FORCE" = 1 ] && printf '%s\n' "$*" >&3; return 0; }
+
+[ -n "${SESSION_NAMER_DISABLE:-}" ] && { say "session-namer is disabled (SESSION_NAMER_DISABLE is set)"; exit 0; }
 
 # Guard against recursion: the `-p` call below still loads user settings (so
 # apiKeyHelper and proxy setups keep working), and with them these hooks.
 [ -n "${SESSION_NAMER_RUNNING:-}" ] && exit 0
 export SESSION_NAMER_RUNNING=1
 
-command -v jq >/dev/null 2>&1 || exit 0
+command -v jq >/dev/null 2>&1 || { say "not renamed: jq is not on PATH"; exit 0; }
 
 # Resolve through `command -v` so a bare name on PATH works as well as an
 # absolute path — `[ -x ]` alone would reject the former.
 CLAUDE_BIN=$(command -v "${SESSION_NAMER_CLAUDE_BIN:-claude}" 2>/dev/null)
-[ -n "$CLAUDE_BIN" ] || exit 0
+[ -n "$CLAUDE_BIN" ] || { say "not renamed: the claude CLI is not on PATH"; exit 0; }
 
 MODEL=haiku
 MAX_RENAMES="${SESSION_NAMER_MAX_RENAMES:-3}"
@@ -67,17 +80,35 @@ LOG="$TMP/session-namer.log"
 errout=/dev/null
 [ -n "${SESSION_NAMER_DEBUG:-}" ] && errout="$LOG"
 log() {
+  say "$*"
   [ -n "${SESSION_NAMER_DEBUG:-}" ] || return 0
   printf '%s %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "${session_id:-?}" "$*" >> "$LOG"
 }
 
-payload=$(cat)
-field() { printf '%s' "$payload" | jq -r "$1 // empty" 2>/dev/null; }
-transcript=$(field .transcript_path)
-session_id=$(field .session_id)
-prompt=$(field .prompt)
-project_dir=$(field .cwd)
-start_source=$(field .source)
+if [ "$FORCE" = 1 ]; then
+  # No payload: find the session ourselves. The id comes from the command's
+  # argument or from the environment Claude Code gives its shell; failing
+  # both, take the most recently written transcript of this project.
+  prompt="" start_source=""
+  project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+  projects="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+  session_id="${forced_id:-${CLAUDE_CODE_SESSION_ID:-}}"
+  transcript=""
+  if [ -n "$session_id" ]; then
+    transcript=$(ls -t "$projects"/*/"$session_id".jsonl 2>/dev/null | head -n 1)
+  else
+    transcript=$(ls -t "$projects/${project_dir//[^A-Za-z0-9]/-}"/*.jsonl 2>/dev/null | head -n 1)
+    session_id=$(basename "${transcript:-}" .jsonl)
+  fi
+else
+  payload=$(cat)
+  field() { printf '%s' "$payload" | jq -r "$1 // empty" 2>/dev/null; }
+  transcript=$(field .transcript_path)
+  session_id=$(field .session_id)
+  prompt=$(field .prompt)
+  project_dir=$(field .cwd)
+  start_source=$(field .source)
+fi
 
 # SessionStart also fires on /clear and after compaction. A cleared session is
 # empty, and a compacted one gets its next look at the next prompt.
@@ -85,23 +116,41 @@ case "$start_source" in
   clear|compact) exit 0 ;;
 esac
 
-[ -n "$transcript" ] && [ -n "$session_id" ] && [ -f "$transcript" ] || exit 0
+# Typing /name-session also fires UserPromptSubmit. Leave that one to the
+# --force run the command starts, and keep the command out of the transcript
+# the name is drawn from.
+case "$prompt" in
+  /name-session*|/session-namer:*) exit 0 ;;
+esac
+
+[ -n "$transcript" ] && [ -n "$session_id" ] && [ -f "$transcript" ] \
+  || { say "not renamed: could not find a transcript for session '${session_id:-unknown}'"; exit 0; }
 
 # --- One run per session at a time -----------------------------------------
 #
 # On resume, SessionStart and the first UserPromptSubmit overlap; without a
 # lock both would call the model and both would write a name.
 lock="$TMP/session-namer-${session_id//[^A-Za-z0-9._-]/_}.lock"
-if ! mkdir "$lock" 2>/dev/null; then
+take_lock() {
+  mkdir "$lock" 2>/dev/null && return 0
   # A run that was killed leaves its lock behind; ignore one older than the
   # hook timeout.
   if [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
     rmdir "$lock" 2>/dev/null
-    mkdir "$lock" 2>/dev/null || exit 0
-  else
-    log "skip: another run is naming this session"
-    exit 0
+    mkdir "$lock" 2>/dev/null && return 0
   fi
+  return 1
+}
+if ! take_lock; then
+  # A hook run is already naming this session. A hook steps aside; an explicit
+  # request waits its turn.
+  [ "$FORCE" = 1 ] || { log "skip: another run is naming this session"; exit 0; }
+  waited=0
+  until take_lock; do
+    waited=$((waited + 1))
+    [ "$waited" -le 60 ] || { log "not renamed: another run is still naming this session"; exit 0; }
+    sleep 1
+  done
 fi
 trap 'rmdir "$lock" 2>/dev/null' EXIT
 
@@ -120,7 +169,7 @@ our_renames=$(printf '%s\n' "$our_titles" | grep -c '[^[:space:]]')
 named_at=$(printf '%s\n' "$title_lines" | jq -r 'select(.sessionNamer == true) | .sessionNamerTurn // empty' 2>/dev/null | tail -n 1)
 case "$named_at" in ''|*[!0-9]*) named_at=0 ;; esac
 
-if [ -n "$current_title" ]; then
+if [ -n "$current_title" ] && [ "$FORCE" != 1 ]; then
   printf '%s\n' "$our_titles" | grep -qxF "$current_title" || { log "skip: named by hand"; exit 0; }
   [ "$our_renames" -ge "$MAX_RENAMES" ] && { log "skip: rename budget spent"; exit 0; }
 fi
@@ -135,7 +184,7 @@ fi
 # with `inputs` rather than slurped: transcripts grow large.
 turns=$(jq -nc '
   [ inputs
-    | select((.type == "user" or .type == "assistant") and (.isSidechain != true))
+    | select((.type == "user" or .type == "assistant") and (.isSidechain != true) and (.isMeta != true))
     | { role: .type,
         text: (.message.content
                | if type == "string" then .
@@ -150,7 +199,9 @@ turns=$(jq -nc '
 turn_count=$(printf '%s' "$turns" | jq '[.[] | select(.role == "user")] | length' 2>/dev/null || echo 0)
 [ -n "$prompt" ] && turn_count=$((turn_count + 1))
 
-if [ -z "$current_title" ]; then
+if [ "$FORCE" = 1 ]; then
+  : # Asked for by name: no cadence applies.
+elif [ -z "$current_title" ]; then
   # Unnamed. Try on every prompt while the session is young, then fall back to
   # the re-check cadence so a session the model keeps declining does not cost
   # a call per prompt forever. SessionStart (no prompt) always gets its try.
@@ -208,7 +259,13 @@ if [ -z "$convention" ]; then
 - Write the title in the language the user writes in."
 fi
 
-if [ -n "$current_title" ]; then
+if [ "$FORCE" = 1 ]; then
+  # The user asked for a name, so always give one for the session as it
+  # stands; only a conversation with nothing in it is declined.
+  standing="${current_title:+This session is currently named: $current_title
+Write the best name for the session as it stands now. It may differ from the current name.
+}If the conversation carries no identifiable task at all, output exactly: SKIP"
+elif [ -n "$current_title" ]; then
   standing="This session is currently named: $current_title
 Output a new name ONLY if the work has clearly moved on from that name.
 If the current name still fits, output exactly: SKIP"
@@ -262,12 +319,12 @@ else
   case "$name" in ''|'<'*) log "discard: $name"; exit 0 ;; esac
 fi
 
-[ "$name" = "$current_title" ] && { log "skip: same name"; exit 0; }
+[ "$name" = "$current_title" ] && { log "skip: same name: $name"; exit 0; }
 
 # Re-check: the session may have been renamed while the model was thinking.
 now_lines=$(grep '"type":"custom-title"' "$transcript" 2>/dev/null)
 now_title=$(printf '%s\n' "$now_lines" | tail -n 1 | jq -r '.customTitle // empty' 2>/dev/null)
-if [ -n "$now_title" ] && [ "$now_title" != "$current_title" ]; then
+if [ "$FORCE" != 1 ] && [ -n "$now_title" ] && [ "$now_title" != "$current_title" ]; then
   printf '%s\n' "$now_lines" | jq -r 'select(.sessionNamer == true) | .customTitle // empty' 2>/dev/null \
     | grep -qxF "$now_title" || { log "skip: renamed by hand meanwhile"; exit 0; }
 fi
